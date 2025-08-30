@@ -20,35 +20,78 @@ st.markdown("""
 <style>
     .main-header {
         font-size: 3rem;
-        color: #1f4e79;
+        color: var(--text-color);
         text-align: center;
         margin-bottom: 1rem;
     }
     .sub-header {
         font-size: 1.2rem;
-        color: #666;
+        color: var(--text-color);
+        opacity: 0.8;
         text-align: center;
         margin-bottom: 2rem;
     }
     .chat-container {
-        background-color: #f8f9fa;
+        background-color: var(--background-color);
+        border: 1px solid var(--border-color);
         border-radius: 10px;
         padding: 1rem;
         margin: 1rem 0;
     }
     .steve-response {
-        background-color: #e3f2fd;
-        border-left: 4px solid #2196f3;
+        background-color: var(--primary-background);
+        border-left: 4px solid #0066cc;
         padding: 1rem;
         border-radius: 5px;
         margin: 1rem 0;
+        color: var(--text-color);
     }
     .user-message {
-        background-color: #f1f8e9;
-        border-left: 4px solid #4caf50;
+        background-color: var(--secondary-background);
+        border-left: 4px solid #00aa44;
         padding: 1rem;
         border-radius: 5px;
         margin: 1rem 0;
+        color: var(--text-color);
+    }
+    
+    /* Light mode colors */
+    [data-theme="light"] {
+        --text-color: #1f4e79;
+        --background-color: #f8f9fa;
+        --border-color: #dee2e6;
+        --primary-background: #e3f2fd;
+        --secondary-background: #f1f8e9;
+    }
+    
+    /* Dark mode colors */
+    [data-theme="dark"] {
+        --text-color: #87ceeb;
+        --background-color: #2d3748;
+        --border-color: #4a5568;
+        --primary-background: #2c5282;
+        --secondary-background: #2f855a;
+    }
+    
+    /* Auto-detect system theme */
+    @media (prefers-color-scheme: light) {
+        :root {
+            --text-color: #1f4e79;
+            --background-color: #f8f9fa;
+            --border-color: #dee2e6;
+            --primary-background: #e3f2fd;
+            --secondary-background: #f1f8e9;
+        }
+    }
+    
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --text-color: #87ceeb;
+            --background-color: #2d3748;
+            --border-color: #4a5568;
+            --primary-background: #2c5282;
+            --secondary-background: #2f855a;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -134,54 +177,101 @@ class SteveWebApp:
     
     def analyze_excel(self, uploaded_file):
         try:
-            excel_data = pd.ExcelFile(uploaded_file)
-            sheets_analysis = {}
             filename = uploaded_file.name
+            uploaded_file.seek(0)
+            
+            try:
+                excel_data = pd.ExcelFile(uploaded_file)
+            except Exception as e:
+                return {'filename': filename, 'error': f"Could not read Excel file: {str(e)}"}
+            
+            sheets_analysis = {}
+            total_rows = 0
+            total_insurance_cols = 0
             
             for sheet_name in excel_data.sheet_names:
-                df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-                
-                sheet_analysis = {
-                    'sheet_name': sheet_name,
-                    'rows': len(df),
-                    'columns': len(df.columns),
-                    'column_names': list(df.columns),
-                    'dataframe': df,
-                    'insurance_columns': [],
-                    'summary_stats': {}
-                }
-                
-                for col in df.columns:
-                    col_lower = col.lower()
-                    for category, keywords in self.insurance_keywords.items():
-                        if any(keyword in col_lower for keyword in keywords):
-                            sheet_analysis['insurance_columns'].append({
-                                'column': col,
-                                'category': category
-                            })
-                
-                numeric_cols = df.select_dtypes(include=[np.number]).columns
-                for col in numeric_cols:
-                    if not df[col].empty and not df[col].isna().all():
-                        sheet_analysis['summary_stats'][col] = {
-                            'mean': float(df[col].mean()),
-                            'sum': float(df[col].sum())
-                        }
-                
-                sheets_analysis[sheet_name] = sheet_analysis
+                try:
+                    uploaded_file.seek(0)
+                    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
+                    
+                    if df.empty:
+                        continue
+                    
+                    sheet_analysis = {
+                        'sheet_name': sheet_name,
+                        'rows': len(df),
+                        'columns': len(df.columns),
+                        'column_names': list(df.columns),
+                        'dataframe': df,
+                        'insurance_columns': [],
+                        'summary_stats': {},
+                        'data_quality': {}
+                    }
+                    
+                    for col in df.columns:
+                        col_lower = str(col).lower()
+                        for category, keywords in self.insurance_keywords.items():
+                            if any(keyword in col_lower for keyword in keywords):
+                                sheet_analysis['insurance_columns'].append({
+                                    'column': col,
+                                    'category': category
+                                })
+                    
+                    numeric_cols = df.select_dtypes(include=[np.number]).columns
+                    for col in numeric_cols:
+                        if not df[col].empty and not df[col].isna().all():
+                            sheet_analysis['summary_stats'][col] = {
+                                'mean': float(df[col].mean()),
+                                'sum': float(df[col].sum()),
+                                'min': float(df[col].min()),
+                                'max': float(df[col].max()),
+                                'median': float(df[col].median())
+                            }
+                    
+                    missing_data = {}
+                    for col in df.columns:
+                        null_pct = (df[col].isnull().sum() / len(df)) * 100
+                        if null_pct > 5:
+                            missing_data[col] = {
+                                'count': int(df[col].isnull().sum()),
+                                'percentage': round(null_pct, 1)
+                            }
+                    
+                    sheet_analysis['data_quality']['missing_data'] = missing_data
+                    sheet_analysis['data_quality']['duplicates'] = len(df) - len(df.drop_duplicates())
+                    
+                    sheets_analysis[sheet_name] = sheet_analysis
+                    total_rows += len(df)
+                    total_insurance_cols += len(sheet_analysis['insurance_columns'])
+                    
+                except Exception as e:
+                    sheets_analysis[sheet_name] = {
+                        'sheet_name': sheet_name,
+                        'error': f"Error processing sheet: {str(e)}"
+                    }
             
             analysis = {
                 'filename': filename,
                 'type': 'Excel',
                 'sheets': sheets_analysis,
-                'total_sheets': len(excel_data.sheet_names)
+                'total_sheets': len(excel_data.sheet_names),
+                'processed_sheets': len([s for s in sheets_analysis.values() if 'error' not in s]),
+                'total_rows': total_rows,
+                'total_insurance_cols': total_insurance_cols,
+                'recommendations': []
             }
+            
+            if total_insurance_cols > 0:
+                analysis['recommendations'].append("📊 Insurance data detected across Excel sheets - ready for analysis!")
+            if analysis['processed_sheets'] < analysis['total_sheets']:
+                analysis['recommendations'].append("⚠️ Some sheets couldn't be processed - check for formatting issues")
             
             st.session_state.analyzed_data[filename] = analysis
             return analysis
             
         except Exception as e:
-            return {'filename': uploaded_file.name, 'error': str(e)}
+            return {'filename': uploaded_file.name, 'error': f"Excel analysis failed: {str(e)}"}
+
     
     def analyze_pdf(self, uploaded_file):
         try:
@@ -288,6 +378,11 @@ class SteveWebApp:
                     response_parts.append(f"📄 **{filename}** Summary:")
                     response_parts.append(f"• {analysis['rows']:,} rows × {analysis['columns']} columns")
                     response_parts.append(f"• Insurance columns detected: {len(analysis['insurance_columns'])}")
+                elif analysis['type'] == 'Excel':
+                    response_parts.append(f"📄 **{filename}** Summary:")
+                    response_parts.append(f"• {analysis['total_sheets']} sheets, {analysis.get('total_rows', 0):,} total rows")
+                    response_parts.append(f"• {analysis.get('total_insurance_cols', 0)} insurance columns across all sheets")
+                    response_parts.append(f"• Successfully processed: {analysis.get('processed_sheets', 0)}/{analysis['total_sheets']} sheets")
                 elif analysis['type'] == 'PDF':
                     response_parts.append(f"📄 **{filename}** Summary:")
                     response_parts.append(f"• Document Type: {analysis['document_type']}")
@@ -302,6 +397,14 @@ class SteveWebApp:
                         if stats['sum'] > 0 and any(keyword in col.lower() for keyword in ['premium', 'amount', 'paid', 'loss', 'reserve']):
                             response_parts.append(f"• {col}: ${stats['sum']:,.2f} (avg: ${stats['mean']:,.2f})")
                             found_totals = True
+                elif analysis['type'] == 'Excel':
+                    response_parts.append(f"💰 **{filename}** - Excel Financial Totals:")
+                    for sheet_name, sheet_info in analysis['sheets'].items():
+                        if 'error' not in sheet_info and sheet_info.get('summary_stats'):
+                            for col, stats in sheet_info['summary_stats'].items():
+                                if stats['sum'] > 0 and any(keyword in col.lower() for keyword in ['premium', 'amount', 'paid', 'loss', 'reserve']):
+                                    response_parts.append(f"• {sheet_name} - {col}: ${stats['sum']:,.2f}")
+                                    found_totals = True
             
             if not found_totals:
                 response_parts.append("🔍 I couldn't find obvious monetary columns. Could you specify which amounts you're interested in?")
@@ -426,9 +529,37 @@ def main():
                                 st.warning(f"**{col}**: {info['percentage']}% missing data ({info['count']} rows)")
                     
                     elif analysis['type'] == 'Excel':
-                        st.metric("Total Sheets", analysis['total_sheets'])
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Total Sheets", analysis['total_sheets'])
+                        with col2:
+                            st.metric("Processed Sheets", f"{analysis.get('processed_sheets', 0)}")
+                        with col3:
+                            st.metric("Total Rows", f"{analysis.get('total_rows', 0):,}")
+                        with col4:
+                            st.metric("Insurance Columns", analysis.get('total_insurance_cols', 0))
+                        
                         for sheet_name, sheet_info in analysis['sheets'].items():
-                            st.write(f"📋 **{sheet_name}**: {sheet_info['rows']:,} rows × {sheet_info['columns']} columns")
+                            if 'error' in sheet_info:
+                                st.error(f"**{sheet_name}**: {sheet_info['error']}")
+                            else:
+                                st.write(f"📋 **{sheet_name}**: {sheet_info['rows']:,} rows × {sheet_info['columns']} columns")
+                                
+                                if sheet_info.get('insurance_columns'):
+                                    st.write("🏢 Insurance columns detected:")
+                                    for col_info in sheet_info['insurance_columns']:
+                                        st.write(f"  • **{col_info['column']}** ({col_info['category']})")
+                                
+                                if sheet_info.get('data_quality', {}).get('missing_data'):
+                                    st.write("⚠️ Data quality issues:")
+                                    for col, info in sheet_info['data_quality']['missing_data'].items():
+                                        st.warning(f"  {col}: {info['percentage']}% missing")
+                        
+                        if analysis.get('recommendations'):
+                            st.subheader("💡 Recommendations")
+                            for rec in analysis['recommendations']:
+                                st.write(f"• {rec}")
+
                     
                     elif analysis['type'] == 'PDF':
                         st.write(f"**Document Type**: {analysis['document_type']}")
