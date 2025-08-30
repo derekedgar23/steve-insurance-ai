@@ -5,37 +5,20 @@ import PyPDF2
 import pdfplumber
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
-import json
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
+from scipy import stats
+import seaborn as sns
 warnings.filterwarnings('ignore')
 
-# Optional LLM imports - won't break if not available
 try:
     import openai
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
-
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
-
-try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
-except ImportError:
-    GROQ_AVAILABLE = False
-
-try:
-    from transformers import pipeline
-    HUGGINGFACE_AVAILABLE = True
-except ImportError:
-    HUGGINGFACE_AVAILABLE = False
 
 st.set_page_config(
     page_title="STEVE - Insurance AI",
@@ -58,203 +41,373 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .steve-response {
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin: 0.5rem 0;
+    }
+    .insight-card {
         background-color: var(--primary-background);
         border-left: 4px solid #0066cc;
         padding: 1rem;
         border-radius: 5px;
         margin: 1rem 0;
-        color: var(--text-color);
     }
-    .user-message {
-        background-color: var(--secondary-background);
-        border-left: 4px solid #00aa44;
+    .warning-card {
+        background-color: #fff3cd;
+        border-left: 4px solid #ffc107;
         padding: 1rem;
         border-radius: 5px;
         margin: 1rem 0;
-        color: var(--text-color);
+        color: #856404;
+    }
+    .success-card {
+        background-color: #d1edff;
+        border-left: 4px solid #0066cc;
+        padding: 1rem;
+        border-radius: 5px;
+        margin: 1rem 0;
+        color: #004085;
     }
     
     @media (prefers-color-scheme: light) {
         :root {
             --text-color: #1f4e79;
-            --background-color: #f8f9fa;
-            --border-color: #dee2e6;
             --primary-background: #e3f2fd;
-            --secondary-background: #f1f8e9;
         }
     }
     
     @media (prefers-color-scheme: dark) {
         :root {
             --text-color: #87ceeb;
-            --background-color: #2d3748;
-            --border-color: #4a5568;
             --primary-background: #2c5282;
-            --secondary-background: #2f855a;
         }
     }
 </style>
 """, unsafe_allow_html=True)
 
-class SteveWithLLM:
+class AdvancedInsuranceAnalyzer:
     def __init__(self):
-        self.insurance_keywords = {
-            'claims': ['claim', 'loss', 'incident', 'accident', 'damage', 'injury', 'liability'],
-            'policy': ['policy', 'premium', 'coverage', 'deductible', 'limit', 'insured'],
-            'financial': ['reserve', 'paid', 'outstanding', 'incurred', 'expense', 'settlement'],
-            'legal': ['litigation', 'suit', 'attorney', 'court', 'judgment'],
-            'regulatory': ['filing', 'compliance', 'audit', 'examination']
+        self.insurance_patterns = {
+            'claims': {
+                'keywords': ['claim', 'loss', 'incident', 'accident', 'damage', 'injury', 'liability', 'settlement'],
+                'amount_cols': ['paid', 'incurred', 'reserve', 'settlement', 'indemnity', 'expense'],
+                'date_cols': ['loss_date', 'report_date', 'close_date', 'occurrence', 'reported'],
+                'status_cols': ['status', 'state', 'closed', 'open', 'pending']
+            },
+            'policy': {
+                'keywords': ['policy', 'premium', 'coverage', 'deductible', 'limit', 'insured', 'renewal'],
+                'amount_cols': ['premium', 'limit', 'deductible', 'coverage', 'written', 'earned'],
+                'date_cols': ['effective', 'expiration', 'inception', 'renewal'],
+                'identifier_cols': ['policy_number', 'account', 'producer', 'agent']
+            },
+            'financial': {
+                'keywords': ['reserve', 'paid', 'outstanding', 'incurred', 'expense', 'alae', 'ulae'],
+                'ratio_analysis': True,
+                'trend_analysis': True
+            }
         }
         
         if 'analyzed_data' not in st.session_state:
             st.session_state.analyzed_data = {}
-        if 'chat_history' not in st.session_state:
-            st.session_state.chat_history = []
-        if 'llm_provider' not in st.session_state:
-            st.session_state.llm_provider = 'openai'
+        if 'analysis_insights' not in st.session_state:
+            st.session_state.analysis_insights = {}
     
-    def setup_llm_client(self, provider: str, api_key: str):
-        """Setup the LLM client based on provider"""
-        try:
-            if provider == 'openai' and OPENAI_AVAILABLE:
-                openai.api_key = api_key
-                return True
-            elif provider == 'anthropic' and ANTHROPIC_AVAILABLE:
-                self.anthropic_client = anthropic.Anthropic(api_key=api_key)
-                return True
-            elif provider == 'groq' and GROQ_AVAILABLE:
-                self.groq_client = Groq(api_key=api_key)
-                return True
-            elif provider == 'huggingface' and HUGGINGFACE_AVAILABLE:
-                return True
-            else:
-                st.error(f"{provider} library not installed. Using fallback mode.")
-                return False
-        except Exception as e:
-            st.error(f"Error setting up {provider}: {str(e)}")
-            return False
-    
-    def generate_llm_response(self, user_question: str, context_data: str, provider: str) -> str:
-        """Generate response using the selected LLM provider"""
+    def detect_data_type(self, df: pd.DataFrame) -> str:
+        """Intelligently detect what type of insurance data this is"""
+        column_text = ' '.join(df.columns.astype(str)).lower()
         
-        system_prompt = f"""You are STEVE (Smart Technology for Evaluating insurance documents and Validating Exposures), an AI assistant specialized in Property & Casualty insurance analysis.
-
-You have access to the following analyzed insurance data:
-{context_data}
-
-Your role is to:
-1. Answer questions about insurance data with expertise
-2. Provide insights on claims, policies, premiums, and financial data
-3. Identify trends, patterns, and potential issues
-4. Give actionable recommendations for P&C insurance operations
-5. Explain complex insurance concepts clearly
-
-Always be professional, accurate, and focus on practical insurance applications. Use specific data from the context when possible."""
-
-        try:
-            if provider == 'openai' and OPENAI_AVAILABLE:
-                response = openai.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_question}
-                    ],
-                    max_tokens=1000,
-                    temperature=0.7
-                )
-                return response.choices[0].message.content
-                
-            elif provider == 'anthropic' and ANTHROPIC_AVAILABLE:
-                message = self.anthropic_client.messages.create(
-                    model="claude-3-sonnet-20240229",
-                    max_tokens=1000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_question}]
-                )
-                return message.content[0].text
-                
-            elif provider == 'groq' and GROQ_AVAILABLE:
-                completion = self.groq_client.chat.completions.create(
-                    model="llama3-70b-8192",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_question}
-                    ],
-                    max_tokens=1000,
-                    temperature=0.7
-                )
-                return completion.choices[0].message.content
-                
-            elif provider == 'huggingface' and HUGGINGFACE_AVAILABLE:
-                return self.generate_huggingface_response(user_question, context_data)
-            
-            else:
-                return f"🤖 The {provider} provider is not available. Please install the required package or use a different provider."
-                
-        except Exception as e:
-            return f"Sorry, I encountered an error with the {provider} API: {str(e)}. Please check your API key and try again."
+        claims_score = sum(1 for keyword in self.insurance_patterns['claims']['keywords'] if keyword in column_text)
+        policy_score = sum(1 for keyword in self.insurance_patterns['policy']['keywords'] if keyword in column_text)
+        
+        if claims_score > policy_score:
+            return 'claims_data'
+        elif policy_score > claims_score:
+            return 'policy_data'
+        else:
+            return 'mixed_data'
     
-    def generate_huggingface_response(self, user_question: str, context_data: str) -> str:
-        """Generate response using Hugging Face transformers (local/free option)"""
+    def detect_date_columns(self, df: pd.DataFrame) -> List[str]:
+        """Intelligently detect date columns"""
+        date_columns = []
+        
+        for col in df.columns:
+            col_lower = str(col).lower()
+            
+            # Check for date keywords
+            if any(date_word in col_lower for date_word in ['date', 'time', 'effective', 'expiration', 'loss', 'report']):
+                try:
+                    # Try to parse a sample as date
+                    sample_data = df[col].dropna().head(10)
+                    if not sample_data.empty:
+                        pd.to_datetime(sample_data, errors='raise')
+                        date_columns.append(col)
+                except:
+                    pass
+            
+            # Check if values look like dates
+            elif df[col].dtype == 'object':
+                try:
+                    sample_data = df[col].dropna().head(5)
+                    if not sample_data.empty:
+                        parsed = pd.to_datetime(sample_data, errors='coerce')
+                        if parsed.notna().sum() >= 3:  # At least 3 valid dates
+                            date_columns.append(col)
+                except:
+                    pass
+        
+        return date_columns
+    
+    def detect_monetary_columns(self, df: pd.DataFrame) -> List[Dict]:
+        """Detect and categorize monetary columns"""
+        monetary_columns = []
+        
+        for col in df.columns:
+            col_lower = str(col).lower()
+            
+            # Check for monetary keywords
+            is_monetary = any(keyword in col_lower for keyword in 
+                            ['premium', 'amount', 'paid', 'reserve', 'limit', 'deductible', 
+                             'incurred', 'settlement', 'expense', 'cost', 'value', 'indemnity'])
+            
+            # Check if numeric and potentially monetary
+            if (is_monetary or df[col].dtype in ['int64', 'float64']) and df[col].dtype != 'object':
+                if not df[col].dropna().empty:
+                    sample_values = df[col].dropna().head(10)
+                    # Check if values are reasonable for monetary data
+                    if sample_values.min() >= 0 and sample_values.max() > 100:
+                        
+                        category = 'unknown'
+                        if any(word in col_lower for word in ['premium', 'written', 'earned']):
+                            category = 'premium'
+                        elif any(word in col_lower for word in ['paid', 'payment']):
+                            category = 'paid_loss'
+                        elif any(word in col_lower for word in ['reserve', 'outstanding']):
+                            category = 'reserve'
+                        elif any(word in col_lower for word in ['incurred', 'total']):
+                            category = 'incurred_loss'
+                        elif any(word in col_lower for word in ['limit', 'coverage']):
+                            category = 'limit'
+                        elif any(word in col_lower for word in ['deductible']):
+                            category = 'deductible'
+                        
+                        monetary_columns.append({
+                            'column': col,
+                            'category': category,
+                            'total': float(df[col].sum()),
+                            'mean': float(df[col].mean()),
+                            'median': float(df[col].median()),
+                            'max': float(df[col].max()),
+                            'min': float(df[col].min())
+                        })
+        
+        return monetary_columns
+    
+    def calculate_insurance_ratios(self, df: pd.DataFrame, monetary_cols: List[Dict]) -> Dict:
+        """Calculate key insurance ratios and metrics"""
+        ratios = {}
+        
+        # Find relevant columns
+        premium_cols = [col for col in monetary_cols if col['category'] == 'premium']
+        paid_loss_cols = [col for col in monetary_cols if col['category'] == 'paid_loss']
+        incurred_cols = [col for col in monetary_cols if col['category'] in ['incurred_loss', 'paid_loss']]
+        reserve_cols = [col for col in monetary_cols if col['category'] == 'reserve']
+        
+        if premium_cols and incurred_cols:
+            premium_total = sum(col['total'] for col in premium_cols)
+            incurred_total = sum(col['total'] for col in incurred_cols)
+            
+            if premium_total > 0:
+                ratios['loss_ratio'] = (incurred_total / premium_total) * 100
+                ratios['loss_ratio_interpretation'] = self.interpret_loss_ratio(ratios['loss_ratio'])
+        
+        if paid_loss_cols and reserve_cols:
+            paid_total = sum(col['total'] for col in paid_loss_cols)
+            reserve_total = sum(col['total'] for col in reserve_cols)
+            
+            if paid_total > 0:
+                ratios['reserve_to_paid_ratio'] = (reserve_total / paid_total) * 100
+                ratios['reserve_adequacy'] = self.interpret_reserve_ratio(ratios['reserve_to_paid_ratio'])
+        
+        # Calculate frequency if we can identify claim counts
+        if 'claims_data' in str(df.columns).lower():
+            total_claims = len(df)
+            if premium_cols:
+                avg_premium = sum(col['mean'] for col in premium_cols)
+                if avg_premium > 0:
+                    ratios['frequency'] = total_claims / len(df) if len(df) > 0 else 0
+        
+        return ratios
+    
+    def interpret_loss_ratio(self, loss_ratio: float) -> str:
+        """Interpret loss ratio values"""
+        if loss_ratio < 60:
+            return "Excellent - Very profitable"
+        elif loss_ratio < 80:
+            return "Good - Profitable"
+        elif loss_ratio < 100:
+            return "Acceptable - Breaking even"
+        elif loss_ratio < 120:
+            return "Concerning - Unprofitable"
+        else:
+            return "Poor - Significant losses"
+    
+    def interpret_reserve_ratio(self, reserve_ratio: float) -> str:
+        """Interpret reserve adequacy"""
+        if reserve_ratio < 20:
+            return "Low reserves - May be under-reserved"
+        elif reserve_ratio < 50:
+            return "Moderate reserves - Typical range"
+        elif reserve_ratio < 100:
+            return "High reserves - Conservative approach"
+        else:
+            return "Very high reserves - May be over-reserved"
+    
+    def analyze_trends(self, df: pd.DataFrame, date_cols: List[str], monetary_cols: List[Dict]) -> Dict:
+        """Analyze temporal trends in the data"""
+        trends = {}
+        
+        if not date_cols or not monetary_cols:
+            return trends
+        
+        # Use the first date column found
+        date_col = date_cols[0]
+        
         try:
-            if not HUGGINGFACE_AVAILABLE:
-                return "🤖 Hugging Face transformers not available. Please use a different provider or install transformers."
+            df_trend = df.copy()
+            df_trend[date_col] = pd.to_datetime(df_trend[date_col], errors='coerce')
+            df_trend = df_trend.dropna(subset=[date_col])
             
-            if 'hf_generator' not in st.session_state:
-                st.session_state.hf_generator = pipeline(
-                    "text-generation",
-                    model="microsoft/DialoGPT-medium",
-                    return_full_text=False,
-                    max_new_tokens=200
-                )
+            if len(df_trend) < 2:
+                return trends
             
-            prompt = f"Insurance AI analyzing: {context_data[:200]}... Question: {user_question}"
-            response = st.session_state.hf_generator(prompt)[0]['generated_text']
-            return f"🤖 Based on your insurance data: {response}"
+            # Group by month/quarter for trend analysis
+            df_trend['period'] = df_trend[date_col].dt.to_period('M')
             
+            for mon_col in monetary_cols[:3]:  # Analyze top 3 monetary columns
+                col_name = mon_col['column']
+                if col_name in df_trend.columns:
+                    monthly_data = df_trend.groupby('period')[col_name].agg(['sum', 'count', 'mean']).reset_index()
+                    
+                    if len(monthly_data) >= 3:
+                        # Calculate trend
+                        x = range(len(monthly_data))
+                        y = monthly_data['sum'].values
+                        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+                        
+                        trend_direction = "increasing" if slope > 0 else "decreasing"
+                        trend_strength = "strong" if abs(r_value) > 0.7 else "moderate" if abs(r_value) > 0.3 else "weak"
+                        
+                        trends[col_name] = {
+                            'direction': trend_direction,
+                            'strength': trend_strength,
+                            'correlation': r_value,
+                            'monthly_avg': monthly_data['sum'].mean(),
+                            'latest_month': monthly_data['sum'].iloc[-1],
+                            'change_rate': slope
+                        }
+        
         except Exception as e:
-            return f"🤖 Local AI model error: {str(e)}. Try using an API provider instead."
+            trends['error'] = f"Trend analysis failed: {str(e)}"
+        
+        return trends
+    
+    def detect_anomalies(self, df: pd.DataFrame, monetary_cols: List[Dict]) -> List[Dict]:
+        """Detect statistical anomalies in monetary data"""
+        anomalies = []
+        
+        for mon_col in monetary_cols:
+            col_name = mon_col['column']
+            if col_name in df.columns:
+                data = df[col_name].dropna()
+                
+                if len(data) > 10:  # Need sufficient data
+                    # Use IQR method for outlier detection
+                    Q1 = data.quantile(0.25)
+                    Q3 = data.quantile(0.75)
+                    IQR = Q3 - Q1
+                    
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+                    
+                    outliers = data[(data < lower_bound) | (data > upper_bound)]
+                    
+                    if len(outliers) > 0:
+                        anomalies.append({
+                            'column': col_name,
+                            'outlier_count': len(outliers),
+                            'outlier_percentage': (len(outliers) / len(data)) * 100,
+                            'max_outlier': float(outliers.max()),
+                            'min_outlier': float(outliers.min()),
+                            'severity': 'high' if len(outliers) / len(data) > 0.1 else 'moderate'
+                        })
+        
+        return anomalies
+    
+    def generate_insights(self, analysis: Dict) -> List[str]:
+        """Generate actionable insights based on analysis"""
+        insights = []
+        
+        # Data quality insights
+        if analysis.get('data_quality', {}).get('missing_data'):
+            missing_count = len(analysis['data_quality']['missing_data'])
+            insights.append(f"🔍 Data Quality: {missing_count} columns have significant missing data - prioritize data collection improvements")
+        
+        # Financial insights
+        ratios = analysis.get('ratios', {})
+        if 'loss_ratio' in ratios:
+            lr = ratios['loss_ratio']
+            insights.append(f"📊 Loss Ratio: {lr:.1f}% - {ratios['loss_ratio_interpretation']}")
+            
+            if lr > 100:
+                insights.append(f"⚠️ Action Required: Loss ratio above 100% indicates unprofitability - review pricing and underwriting")
+        
+        if 'reserve_to_paid_ratio' in ratios:
+            insights.append(f"💰 Reserve Analysis: {ratios['reserve_adequacy']}")
+        
+        # Trend insights
+        trends = analysis.get('trends', {})
+        for col, trend_data in trends.items():
+            if isinstance(trend_data, dict) and 'direction' in trend_data:
+                direction = trend_data['direction']
+                strength = trend_data['strength']
+                insights.append(f"📈 Trend Alert: {col} shows {strength} {direction} trend over time")
+        
+        # Anomaly insights
+        anomalies = analysis.get('anomalies', [])
+        for anomaly in anomalies:
+            if anomaly['severity'] == 'high':
+                insights.append(f"🚨 Anomaly Detected: {anomaly['column']} has {anomaly['outlier_percentage']:.1f}% outliers - investigate unusual claims")
+        
+        # Volume insights
+        if analysis.get('rows', 0) > 0:
+            row_count = analysis['rows']
+            if row_count < 100:
+                insights.append(f"📊 Sample Size: Only {row_count} records - consider larger dataset for more reliable analysis")
+            elif row_count > 10000:
+                insights.append(f"📊 Large Dataset: {row_count:,} records provide excellent statistical power")
+        
+        return insights
     
     def analyze_csv(self, uploaded_file):
         try:
             df = pd.read_csv(uploaded_file)
             filename = uploaded_file.name
             
-            analysis = {
-                'filename': filename,
-                'type': 'CSV',
-                'rows': len(df),
-                'columns': len(df.columns),
-                'column_names': list(df.columns),
-                'dataframe': df,
-                'insurance_columns': [],
-                'data_quality': {},
-                'recommendations': [],
-                'summary_stats': {}
-            }
+            # Basic analysis
+            data_type = self.detect_data_type(df)
+            date_columns = self.detect_date_columns(df)
+            monetary_columns = self.detect_monetary_columns(df)
             
-            for col in df.columns:
-                col_lower = col.lower()
-                for category, keywords in self.insurance_keywords.items():
-                    if any(keyword in col_lower for keyword in keywords):
-                        analysis['insurance_columns'].append({
-                            'column': col,
-                            'category': category
-                        })
+            # Advanced analysis
+            ratios = self.calculate_insurance_ratios(df, monetary_columns)
+            trends = self.analyze_trends(df, date_columns, monetary_columns)
+            anomalies = self.detect_anomalies(df, monetary_columns)
             
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            for col in numeric_cols:
-                if not df[col].empty and not df[col].isna().all():
-                    analysis['summary_stats'][col] = {
-                        'mean': float(df[col].mean()),
-                        'median': float(df[col].median()),
-                        'min': float(df[col].min()),
-                        'max': float(df[col].max()),
-                        'sum': float(df[col].sum()),
-                        'std': float(df[col].std())
-                    }
-            
+            # Data quality assessment
             missing_data = {}
             for col in df.columns:
                 null_pct = (df[col].isnull().sum() / len(df)) * 100
@@ -264,8 +417,28 @@ Always be professional, accurate, and focus on practical insurance applications.
                         'percentage': round(null_pct, 1)
                     }
             
-            analysis['data_quality']['missing_data'] = missing_data
-            analysis['data_quality']['duplicates'] = len(df) - len(df.drop_duplicates())
+            analysis = {
+                'filename': filename,
+                'type': 'CSV',
+                'data_type': data_type,
+                'rows': len(df),
+                'columns': len(df.columns),
+                'column_names': list(df.columns),
+                'dataframe': df,
+                'date_columns': date_columns,
+                'monetary_columns': monetary_columns,
+                'ratios': ratios,
+                'trends': trends,
+                'anomalies': anomalies,
+                'data_quality': {
+                    'missing_data': missing_data,
+                    'duplicates': len(df) - len(df.drop_duplicates())
+                }
+            }
+            
+            # Generate insights
+            insights = self.generate_insights(analysis)
+            analysis['insights'] = insights
             
             st.session_state.analyzed_data[filename] = analysis
             return analysis
@@ -273,211 +446,117 @@ Always be professional, accurate, and focus on practical insurance applications.
         except Exception as e:
             return {'filename': uploaded_file.name, 'error': str(e)}
     
-    def analyze_excel(self, uploaded_file):
-        try:
-            filename = uploaded_file.name
-            uploaded_file.seek(0)
+    def create_advanced_visualizations(self, analysis: Dict) -> List[go.Figure]:
+        """Create sophisticated visualizations for insurance data"""
+        figures = []
+        
+        if analysis['type'] != 'CSV' or 'dataframe' not in analysis:
+            return figures
+        
+        df = analysis['dataframe']
+        monetary_cols = analysis['monetary_columns']
+        
+        # 1. Financial Overview Dashboard
+        if len(monetary_cols) >= 2:
+            fig = make_subplots(
+                rows=2, cols=2,
+                subplot_titles=('Premium Distribution', 'Loss Distribution', 'Claims by Amount', 'Ratio Analysis'),
+                specs=[[{"type": "histogram"}, {"type": "histogram"}],
+                       [{"type": "scatter"}, {"type": "bar"}]]
+            )
+            
+            # Premium histogram
+            premium_col = next((col for col in monetary_cols if col['category'] == 'premium'), monetary_cols[0])
+            fig.add_trace(go.Histogram(x=df[premium_col['column']], name='Premium', nbinsx=20), row=1, col=1)
+            
+            # Loss histogram
+            loss_col = next((col for col in monetary_cols if col['category'] in ['paid_loss', 'incurred_loss']), monetary_cols[1])
+            fig.add_trace(go.Histogram(x=df[loss_col['column']], name='Losses', nbinsx=20), row=1, col=2)
+            
+            # Scatter plot
+            fig.add_trace(go.Scatter(
+                x=df[premium_col['column']], 
+                y=df[loss_col['column']],
+                mode='markers',
+                name='Premium vs Loss',
+                marker=dict(color='blue', opacity=0.6)
+            ), row=2, col=1)
+            
+            # Ratios bar chart
+            ratios = analysis.get('ratios', {})
+            if ratios:
+                ratio_names = list(ratios.keys())
+                ratio_values = [ratios[key] for key in ratio_names if isinstance(ratios[key], (int, float))]
+                
+                if ratio_values:
+                    fig.add_trace(go.Bar(
+                        x=ratio_names[:len(ratio_values)],
+                        y=ratio_values,
+                        name='Key Ratios'
+                    ), row=2, col=2)
+            
+            fig.update_layout(height=700, title_text="Insurance Data Analysis Dashboard")
+            figures.append(fig)
+        
+        # 2. Trend Analysis
+        if analysis['date_columns'] and len(monetary_cols) > 0:
+            date_col = analysis['date_columns'][0]
             
             try:
-                excel_data = pd.ExcelFile(uploaded_file)
-            except Exception as e:
-                return {'filename': filename, 'error': f"Could not read Excel file: {str(e)}"}
-            
-            sheets_analysis = {}
-            total_rows = 0
-            total_insurance_cols = 0
-            
-            for sheet_name in excel_data.sheet_names:
-                try:
-                    uploaded_file.seek(0)
-                    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
-                    
-                    if df.empty:
-                        continue
-                    
-                    sheet_analysis = {
-                        'sheet_name': sheet_name,
-                        'rows': len(df),
-                        'columns': len(df.columns),
-                        'column_names': list(df.columns),
-                        'dataframe': df,
-                        'insurance_columns': [],
-                        'summary_stats': {}
-                    }
-                    
-                    for col in df.columns:
-                        col_lower = str(col).lower()
-                        for category, keywords in self.insurance_keywords.items():
-                            if any(keyword in col_lower for keyword in keywords):
-                                sheet_analysis['insurance_columns'].append({
-                                    'column': col,
-                                    'category': category
-                                })
-                    
-                    numeric_cols = df.select_dtypes(include=[np.number]).columns
-                    for col in numeric_cols:
-                        if not df[col].empty and not df[col].isna().all():
-                            sheet_analysis['summary_stats'][col] = {
-                                'mean': float(df[col].mean()),
-                                'sum': float(df[col].sum()),
-                                'min': float(df[col].min()),
-                                'max': float(df[col].max())
-                            }
-                    
-                    sheets_analysis[sheet_name] = sheet_analysis
-                    total_rows += len(df)
-                    total_insurance_cols += len(sheet_analysis['insurance_columns'])
-                    
-                except Exception as e:
-                    sheets_analysis[sheet_name] = {
-                        'sheet_name': sheet_name,
-                        'error': f"Error processing sheet: {str(e)}"
-                    }
-            
-            analysis = {
-                'filename': filename,
-                'type': 'Excel',
-                'sheets': sheets_analysis,
-                'total_sheets': len(excel_data.sheet_names),
-                'total_rows': total_rows,
-                'total_insurance_cols': total_insurance_cols
-            }
-            
-            st.session_state.analyzed_data[filename] = analysis
-            return analysis
-            
-        except Exception as e:
-            return {'filename': uploaded_file.name, 'error': f"Excel analysis failed: {str(e)}"}
-    
-    def prepare_context_for_llm(self) -> str:
-        """Prepare analyzed data context for the LLM"""
-        if not st.session_state.analyzed_data:
-            return "No insurance data has been analyzed yet."
-        
-        context_parts = []
-        
-        for filename, analysis in st.session_state.analyzed_data.items():
-            if analysis['type'] == 'CSV':
-                context_parts.append(f"CSV File: {filename}")
-                context_parts.append(f"- {analysis['rows']:,} rows, {analysis['columns']} columns")
-                context_parts.append(f"- Columns: {', '.join(analysis['column_names'])}")
+                df_trend = df.copy()
+                df_trend[date_col] = pd.to_datetime(df_trend[date_col], errors='coerce')
+                df_trend = df_trend.dropna(subset=[date_col])
                 
-                if analysis['insurance_columns']:
-                    ins_cols = [f"{col['column']} ({col['category']})" for col in analysis['insurance_columns']]
-                    context_parts.append(f"- Insurance columns: {', '.join(ins_cols)}")
-                
-                if analysis['summary_stats']:
-                    context_parts.append("- Financial data:")
-                    for col, stats in analysis['summary_stats'].items():
-                        if any(kw in col.lower() for kw in ['premium', 'amount', 'paid', 'loss', 'reserve']):
-                            context_parts.append(f"  * {col}: Total ${stats['sum']:,.2f}, Average ${stats['mean']:,.2f}")
-                
-            elif analysis['type'] == 'Excel':
-                context_parts.append(f"Excel File: {filename}")
-                context_parts.append(f"- {analysis['total_sheets']} sheets, {analysis['total_rows']:,} total rows")
-                
-                for sheet_name, sheet_info in analysis['sheets'].items():
-                    if 'error' not in sheet_info:
-                        context_parts.append(f"- Sheet '{sheet_name}': {sheet_info['rows']:,} rows")
-                        if sheet_info['insurance_columns']:
-                            ins_cols = [col['column'] for col in sheet_info['insurance_columns']]
-                            context_parts.append(f"  * Insurance columns: {', '.join(ins_cols)}")
+                if len(df_trend) > 1:
+                    df_trend = df_trend.sort_values(date_col)
+                    df_trend['month'] = df_trend[date_col].dt.to_period('M').astype(str)
+                    
+                    fig_trend = go.Figure()
+                    
+                    for mon_col in monetary_cols[:3]:  # Top 3 monetary columns
+                        monthly_sum = df_trend.groupby('month')[mon_col['column']].sum()
+                        fig_trend.add_trace(go.Scatter(
+                            x=monthly_sum.index,
+                            y=monthly_sum.values,
+                            mode='lines+markers',
+                            name=f"{mon_col['column']} ({mon_col['category']})"
+                        ))
+                    
+                    fig_trend.update_layout(
+                        title="Temporal Trends Analysis",
+                        xaxis_title="Month",
+                        yaxis_title="Amount ($)",
+                        height=400
+                    )
+                    figures.append(fig_trend)
+            except:
+                pass
         
-        return "\n".join(context_parts)
-    
-    def generate_chat_response(self, question: str, provider: str) -> str:
-        """Generate intelligent chat response using LLM"""
-        if not st.session_state.analyzed_data:
-            return "🤖 Hi! I don't have any documents analyzed yet. Please upload and analyze some insurance files first, then I can answer questions about them using advanced AI!"
-        
-        context_data = self.prepare_context_for_llm()
-        
-        if provider == 'fallback':
-            return self.generate_fallback_response(question)
-        
-        return self.generate_llm_response(question, context_data, provider)
-    
-    def generate_fallback_response(self, question: str) -> str:
-        """Simple fallback response without LLM API"""
-        question_lower = question.lower()
-        
-        if 'hello' in question_lower or 'hi' in question_lower:
-            return "🤖 Hello! I'm STEVE, your insurance AI assistant. I can analyze your data and answer questions. For advanced AI responses, please configure an API key in the sidebar!"
-        
-        context = self.prepare_context_for_llm()
-        return f"🤖 Here's what I found in your data:\n\n{context}\n\nFor more intelligent analysis and insights, please set up an LLM API in the sidebar settings."
+        return figures
 
 def main():
-    steve = SteveWithLLM()
+    analyzer = AdvancedInsuranceAnalyzer()
     
     st.markdown('<div class="main-header">🤖 STEVE</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Smart Technology for Evaluating insurance documents and Validating Exposures</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Advanced Insurance Analytics Platform</div>', unsafe_allow_html=True)
     
     with st.sidebar:
-        st.header("🔧 LLM Configuration")
-        
-        available_providers = ['fallback']
-        if OPENAI_AVAILABLE:
-            available_providers.insert(0, 'openai')
-        if ANTHROPIC_AVAILABLE:
-            available_providers.insert(-1, 'anthropic')
-        if GROQ_AVAILABLE:
-            available_providers.insert(-1, 'groq')
-        if HUGGINGFACE_AVAILABLE:
-            available_providers.insert(-1, 'huggingface')
-        
-        provider = st.selectbox(
-            "Choose LLM Provider:",
-            available_providers,
-            help="Select your preferred AI model provider"
-        )
-        
-        if provider == 'fallback':
-            st.info("📊 Using basic pattern matching (no AI)")
-            st.session_state.llm_provider = provider
-        elif provider == 'huggingface':
-            if HUGGINGFACE_AVAILABLE:
-                st.info("🤗 Using local Hugging Face model (free, but slower)")
-                st.session_state.llm_provider = provider
-            else:
-                st.error("❌ Transformers library not installed")
-        else:
-            if provider in ['openai', 'anthropic', 'groq']:
-                api_key = st.text_input(
-                    f"Enter {provider.upper()} API Key:",
-                    type="password",
-                    help=f"Get your API key from {provider}.com"
-                )
-                
-                if api_key:
-                    if steve.setup_llm_client(provider, api_key):
-                        st.success(f"✅ Connected to {provider.upper()}")
-                        st.session_state.llm_provider = provider
-                    else:
-                        st.error(f"❌ Failed to connect to {provider.upper()}")
-                        st.session_state.llm_provider = 'fallback'
-                else:
-                    st.warning(f"⚠️ Please enter your {provider.upper()} API key")
-                    st.session_state.llm_provider = 'fallback'
-        
         st.header("📁 Upload Documents")
         uploaded_files = st.file_uploader(
             "Choose insurance files to analyze",
-            type=['csv', 'xlsx', 'xls', 'pdf'],
+            type=['csv', 'xlsx', 'xls'],
             accept_multiple_files=True,
-            help="Upload CSV, Excel, or PDF files for analysis"
+            help="Upload CSV or Excel files for advanced analysis"
         )
         
         if uploaded_files:
             st.write(f"📄 {len(uploaded_files)} file(s) uploaded")
             
             if st.button("🚀 Analyze Files", type="primary"):
-                with st.spinner("STEVE is analyzing your files..."):
+                with st.spinner("STEVE is performing advanced analysis..."):
                     for file in uploaded_files:
                         if file.name.endswith('.csv'):
-                            result = steve.analyze_csv(file)
-                        elif file.name.endswith(('.xlsx', '.xls')):
-                            result = steve.analyze_excel(file)
+                            result = analyzer.analyze_csv(file)
                         
                         if 'error' not in result:
                             st.success(f"✅ Analyzed: {file.name}")
@@ -490,36 +569,35 @@ def main():
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown("""
-            ### 🚀 Welcome to STEVE with AI!
+            ### 🚀 Welcome to Advanced STEVE!
             
-            Your AI-powered insurance document analysis platform with advanced language model integration.
+            **🎯 Advanced Insurance Analytics:**
+            - **Loss Ratio Analysis** - Profitability assessment
+            - **Reserve Adequacy** - Financial health metrics
+            - **Trend Detection** - Temporal pattern analysis
+            - **Anomaly Detection** - Unusual claims identification
+            - **Data Quality Assessment** - Completeness evaluation
             
-            **🧠 AI-Powered Features:**
-            - **GPT-4** integration for advanced analysis
-            - **Claude** support for detailed insights
-            - **Groq** for fast responses
-            - **Local AI** options available
+            **📊 Sophisticated Visualizations:**
+            - Interactive dashboards
+            - Trend analysis charts  
+            - Statistical distributions
+            - Comparative analytics
             
-            **📊 What STEVE can analyze:**
-            - Claims data and loss runs
-            - Policy information and coverage details
-            - Financial reports and premium data
-            - Regulatory filings and compliance documents
+            **🔍 Actionable Insights:**
+            - Business recommendations
+            - Risk assessments
+            - Performance benchmarks
+            - Strategic guidance
             
-            **🔧 Setup:**
-            1. Choose your AI provider in the sidebar
-            2. Enter your API key (or use free local option)
-            3. Upload your insurance files
-            4. Chat with STEVE using advanced AI!
-            
-            Ready for intelligent insurance analysis? Configure your AI and upload files! 🚀
+            Upload your insurance data to experience enterprise-grade analytics! 🚀
             """)
     
     else:
-        tab1, tab2, tab3 = st.tabs(["📊 Analysis Results", "💬 Chat with AI STEVE", "📈 Visualizations"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Advanced Analysis", "📈 Visualizations", "🎯 Key Insights", "💬 Chat"])
         
         with tab1:
-            st.header("📊 Analysis Results")
+            st.header("📊 Advanced Insurance Analysis")
             
             for filename, analysis in st.session_state.analyzed_data.items():
                 with st.expander(f"📄 {filename}", expanded=True):
@@ -527,113 +605,89 @@ def main():
                         st.error(f"Error: {analysis['error']}")
                         continue
                     
-                    if analysis['type'] == 'CSV':
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Rows", f"{analysis['rows']:,}")
-                        with col2:
-                            st.metric("Columns", analysis['columns'])
-                        with col3:
-                            st.metric("Insurance Columns", len(analysis['insurance_columns']))
-                        with col4:
-                            quality_score = "Good" if not analysis['data_quality']['missing_data'] else "Issues"
-                            st.metric("Data Quality", quality_score)
-                        
-                        if analysis['insurance_columns']:
-                            st.subheader("🏢 Insurance Columns Detected")
-                            for col_info in analysis['insurance_columns']:
-                                st.write(f"• **{col_info['column']}** ({col_info['category']})")
+                    # Key metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Records", f"{analysis['rows']:,}")
+                    with col2:
+                        st.metric("Data Type", analysis['data_type'].replace('_', ' ').title())
+                    with col3:
+                        st.metric("Monetary Columns", len(analysis['monetary_columns']))
+                    with col4:
+                        st.metric("Date Columns", len(analysis['date_columns']))
                     
-                    elif analysis['type'] == 'Excel':
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Total Sheets", analysis['total_sheets'])
-                        with col2:
-                            st.metric("Total Rows", f"{analysis['total_rows']:,}")
-                        with col3:
-                            st.metric("Insurance Columns", analysis['total_insurance_cols'])
+                    # Financial Ratios
+                    if analysis.get('ratios'):
+                        st.subheader("💰 Financial Analysis")
+                        ratios = analysis['ratios']
                         
-                        for sheet_name, sheet_info in analysis['sheets'].items():
-                            if 'error' not in sheet_info:
-                                st.write(f"📋 **{sheet_name}**: {sheet_info['rows']:,} rows × {sheet_info['columns']} columns")
+                        if 'loss_ratio' in ratios:
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Loss Ratio", f"{ratios['loss_ratio']:.1f}%")
+                            with col2:
+                                interpretation = ratios.get('loss_ratio_interpretation', '')
+                                color = "success" if "Excellent" in interpretation or "Good" in interpretation else "warning"
+                                st.markdown(f"<div class='{color}-card'>{interpretation}</div>", unsafe_allow_html=True)
+                        
+                        if 'reserve_to_paid_ratio' in ratios:
+                            st.markdown(f"**Reserve Adequacy:** {ratios['reserve_adequacy']}")
+                    
+                    # Monetary Columns Analysis
+                    if analysis['monetary_columns']:
+                        st.subheader("💵 Monetary Analysis")
+                        for mon_col in analysis['monetary_columns']:
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric(f"{mon_col['column']}", f"${mon_col['total']:,.0f}")
+                            with col2:
+                                st.metric("Average", f"${mon_col['mean']:,.0f}")
+                            with col3:
+                                st.metric("Median", f"${mon_col['median']:,.0f}")
+                            with col4:
+                                st.metric("Max", f"${mon_col['max']:,.0f}")
+                    
+                    # Anomalies
+                    if analysis.get('anomalies'):
+                        st.subheader("🚨 Anomaly Detection")
+                        for anomaly in analysis['anomalies']:
+                            severity_color = "error" if anomaly['severity'] == 'high' else "warning"
+                            st.markdown(f"""
+                            <div class='warning-card'>
+                            <strong>{anomaly['column']}</strong>: {anomaly['outlier_count']} outliers 
+                            ({anomaly['outlier_percentage']:.1f}% of data) - Severity: {anomaly['severity']}
+                            </div>
+                            """, unsafe_allow_html=True)
         
         with tab2:
-            st.header("💬 Chat with AI STEVE")
-            
-            provider_status = st.session_state.get('llm_provider', 'fallback')
-            if provider_status == 'fallback':
-                st.warning("⚠️ Using basic responses. Configure an LLM API in the sidebar for intelligent AI chat!")
-            elif provider_status == 'huggingface':
-                st.info("🤗 Using local Hugging Face AI model")
-            else:
-                st.success(f"🤖 Connected to {provider_status.upper()} AI")
-            
-            if 'chat_history' not in st.session_state:
-                st.session_state.chat_history = []
-            
-            for chat in st.session_state.chat_history:
-                st.markdown(f'<div class="user-message"><strong>You:</strong> {chat["user"]}</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="steve-response"><strong>🤖 AI STEVE:</strong> {chat["steve"]}</div>', unsafe_allow_html=True)
-            
-            user_question = st.text_input("Ask STEVE anything about your insurance data:", placeholder="What insights can you provide about my claims data?", key="chat_input")
-            
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("Send 🚀"):
-                    if user_question:
-                        with st.spinner("🤖 AI STEVE is thinking..."):
-                            response = steve.generate_chat_response(user_question, st.session_state.llm_provider)
-                            st.session_state.chat_history.append({
-                                "user": user_question,
-                                "steve": response
-                            })
-                        st.rerun()
-            
-            with col2:
-                if st.button("Clear Chat 🗑️"):
-                    st.session_state.chat_history = []
-                    st.rerun()
-            
-            st.subheader("💡 AI-Powered Questions to Try")
-            ai_questions = [
-                "What trends do you see in my insurance data?",
-                "Are there any anomalies or red flags I should investigate?",
-                "What recommendations do you have for improving our loss ratios?",
-                "Can you explain the relationship between premiums and claims in my data?",
-                "What insights can you provide about our policy portfolio?",
-                "How does our claims frequency compare to industry standards?"
-            ]
-            
-            cols = st.columns(2)
-            for i, question in enumerate(ai_questions):
-                with cols[i % 2]:
-                    if st.button(question, key=f"ai_suggest_{i}"):
-                        with st.spinner("🤖 AI STEVE is analyzing..."):
-                            response = steve.generate_chat_response(question, st.session_state.llm_provider)
-                            st.session_state.chat_history.append({
-                                "user": question,
-                                "steve": response
-                            })
-                        st.rerun()
-        
-        with tab3:
-            st.header("📈 Data Visualizations")
+            st.header("📈 Advanced Visualizations")
             
             for filename, analysis in st.session_state.analyzed_data.items():
-                if analysis['type'] == 'CSV' and analysis.get('summary_stats'):
+                if 'error' not in analysis:
                     st.subheader(f"📊 {filename}")
                     
-                    monetary_cols = []
-                    for col, stats in analysis['summary_stats'].items():
-                        if any(keyword in col.lower() for keyword in ['premium', 'amount', 'paid', 'loss', 'reserve']):
-                            monetary_cols.append(col)
-                    
-                    if monetary_cols and len(monetary_cols) > 0:
-                        df = analysis['dataframe']
-                        
-                        col = monetary_cols[0]
-                        fig = px.histogram(df, x=col, title=f"Distribution of {col}")
+                    figures = analyzer.create_advanced_visualizations(analysis)
+                    for fig in figures:
                         st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            st.header("🎯 Key Insights & Recommendations")
+            
+            for filename, analysis in st.session_state.analyzed_data.items():
+                if 'error' not in analysis and 'insights' in analysis:
+                    st.subheader(f"💡 {filename}")
+                    
+                    for insight in analysis['insights']:
+                        if '🚨' in insight or '⚠️' in insight:
+                            st.markdown(f'<div class="warning-card">{insight}</div>', unsafe_allow_html=True)
+                        elif '✅' in insight or 'Excellent' in insight:
+                            st.markdown(f'<div class="success-card">{insight}</div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div class="insight-card">{insight}</div>', unsafe_allow_html=True)
+        
+        with tab4:
+            st.header("💬 Chat with STEVE")
+            st.info("🤖 Advanced AI chat coming soon! For now, explore the detailed analysis in other tabs.")
 
 if __name__ == "__main__":
     main()
