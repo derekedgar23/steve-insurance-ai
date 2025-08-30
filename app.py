@@ -8,6 +8,9 @@ import plotly.graph_objects as go
 import re
 from datetime import datetime
 import warnings
+import json
+import openai
+from typing import Dict, List, Any
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
@@ -31,13 +34,6 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .chat-container {
-        background-color: var(--background-color);
-        border: 1px solid var(--border-color);
-        border-radius: 10px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
     .steve-response {
         background-color: var(--primary-background);
         border-left: 4px solid #0066cc;
@@ -55,25 +51,6 @@ st.markdown("""
         color: var(--text-color);
     }
     
-    /* Light mode colors */
-    [data-theme="light"] {
-        --text-color: #1f4e79;
-        --background-color: #f8f9fa;
-        --border-color: #dee2e6;
-        --primary-background: #e3f2fd;
-        --secondary-background: #f1f8e9;
-    }
-    
-    /* Dark mode colors */
-    [data-theme="dark"] {
-        --text-color: #87ceeb;
-        --background-color: #2d3748;
-        --border-color: #4a5568;
-        --primary-background: #2c5282;
-        --secondary-background: #2f855a;
-    }
-    
-    /* Auto-detect system theme */
     @media (prefers-color-scheme: light) {
         :root {
             --text-color: #1f4e79;
@@ -96,7 +73,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-class SteveWebApp:
+class SteveWithLLM:
     def __init__(self):
         self.insurance_keywords = {
             'claims': ['claim', 'loss', 'incident', 'accident', 'damage', 'injury', 'liability'],
@@ -110,6 +87,105 @@ class SteveWebApp:
             st.session_state.analyzed_data = {}
         if 'chat_history' not in st.session_state:
             st.session_state.chat_history = []
+        if 'llm_provider' not in st.session_state:
+            st.session_state.llm_provider = 'openai'
+    
+    def setup_llm_client(self, provider: str, api_key: str):
+        """Setup the LLM client based on provider"""
+        try:
+            if provider == 'openai':
+                openai.api_key = api_key
+                return True
+            elif provider == 'anthropic':
+                import anthropic
+                self.anthropic_client = anthropic.Anthropic(api_key=api_key)
+                return True
+            elif provider == 'groq':
+                from groq import Groq
+                self.groq_client = Groq(api_key=api_key)
+                return True
+            return False
+        except Exception as e:
+            st.error(f"Error setting up {provider}: {str(e)}")
+            return False
+    
+    def generate_llm_response(self, user_question: str, context_data: str, provider: str) -> str:
+        """Generate response using the selected LLM provider"""
+        
+        system_prompt = f"""You are STEVE (Smart Technology for Evaluating insurance documents and Validating Exposures), an AI assistant specialized in Property & Casualty insurance analysis.
+
+You have access to the following analyzed insurance data:
+{context_data}
+
+Your role is to:
+1. Answer questions about insurance data with expertise
+2. Provide insights on claims, policies, premiums, and financial data
+3. Identify trends, patterns, and potential issues
+4. Give actionable recommendations for P&C insurance operations
+5. Explain complex insurance concepts clearly
+
+Always be professional, accurate, and focus on practical insurance applications. Use specific data from the context when possible."""
+
+        try:
+            if provider == 'openai':
+                response = openai.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_question}
+                    ],
+                    max_tokens=1000,
+                    temperature=0.7
+                )
+                return response.choices[0].message.content
+                
+            elif provider == 'anthropic':
+                message = self.anthropic_client.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=1000,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_question}]
+                )
+                return message.content[0].text
+                
+            elif provider == 'groq':
+                completion = self.groq_client.chat.completions.create(
+                    model="llama3-70b-8192",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_question}
+                    ],
+                    max_tokens=1000,
+                    temperature=0.7
+                )
+                return completion.choices[0].message.content
+                
+            elif provider == 'huggingface':
+                return self.generate_huggingface_response(user_question, context_data)
+                
+        except Exception as e:
+            return f"Sorry, I encountered an error with the {provider} API: {str(e)}. Please check your API key and try again."
+    
+    def generate_huggingface_response(self, user_question: str, context_data: str) -> str:
+        """Generate response using Hugging Face transformers (local/free option)"""
+        try:
+            from transformers import pipeline
+            
+            if 'hf_generator' not in st.session_state:
+                st.session_state.hf_generator = pipeline(
+                    "text-generation",
+                    model="microsoft/DialoGPT-medium",
+                    return_full_text=False,
+                    max_new_tokens=200
+                )
+            
+            prompt = f"As an insurance AI assistant analyzing: {context_data[:500]}...\n\nUser question: {user_question}\n\nResponse:"
+            
+            response = st.session_state.hf_generator(prompt)[0]['generated_text']
+            return f"🤖 Based on your insurance data: {response}"
+            
+        except Exception as e:
+            return "I'm having trouble with the local AI model. Please try one of the API options instead."
     
     def analyze_csv(self, uploaded_file):
         try:
@@ -162,13 +238,6 @@ class SteveWebApp:
             analysis['data_quality']['missing_data'] = missing_data
             analysis['data_quality']['duplicates'] = len(df) - len(df.drop_duplicates())
             
-            if analysis['insurance_columns']:
-                analysis['recommendations'].append("📊 Insurance data detected - ready for analysis!")
-            if missing_data:
-                analysis['recommendations'].append("⚠️ Some columns have missing data - consider data cleaning")
-            if analysis['data_quality']['duplicates'] > 0:
-                analysis['recommendations'].append(f"🔄 Found {analysis['data_quality']['duplicates']} duplicate rows")
-            
             st.session_state.analyzed_data[filename] = analysis
             return analysis
             
@@ -204,8 +273,7 @@ class SteveWebApp:
                         'column_names': list(df.columns),
                         'dataframe': df,
                         'insurance_columns': [],
-                        'summary_stats': {},
-                        'data_quality': {}
+                        'summary_stats': {}
                     }
                     
                     for col in df.columns:
@@ -224,21 +292,8 @@ class SteveWebApp:
                                 'mean': float(df[col].mean()),
                                 'sum': float(df[col].sum()),
                                 'min': float(df[col].min()),
-                                'max': float(df[col].max()),
-                                'median': float(df[col].median())
+                                'max': float(df[col].max())
                             }
-                    
-                    missing_data = {}
-                    for col in df.columns:
-                        null_pct = (df[col].isnull().sum() / len(df)) * 100
-                        if null_pct > 5:
-                            missing_data[col] = {
-                                'count': int(df[col].isnull().sum()),
-                                'percentage': round(null_pct, 1)
-                            }
-                    
-                    sheet_analysis['data_quality']['missing_data'] = missing_data
-                    sheet_analysis['data_quality']['duplicates'] = len(df) - len(df.drop_duplicates())
                     
                     sheets_analysis[sheet_name] = sheet_analysis
                     total_rows += len(df)
@@ -255,195 +310,111 @@ class SteveWebApp:
                 'type': 'Excel',
                 'sheets': sheets_analysis,
                 'total_sheets': len(excel_data.sheet_names),
-                'processed_sheets': len([s for s in sheets_analysis.values() if 'error' not in s]),
                 'total_rows': total_rows,
-                'total_insurance_cols': total_insurance_cols,
-                'recommendations': []
+                'total_insurance_cols': total_insurance_cols
             }
-            
-            if total_insurance_cols > 0:
-                analysis['recommendations'].append("📊 Insurance data detected across Excel sheets - ready for analysis!")
-            if analysis['processed_sheets'] < analysis['total_sheets']:
-                analysis['recommendations'].append("⚠️ Some sheets couldn't be processed - check for formatting issues")
             
             st.session_state.analyzed_data[filename] = analysis
             return analysis
             
         except Exception as e:
             return {'filename': uploaded_file.name, 'error': f"Excel analysis failed: {str(e)}"}
-
     
-    def analyze_pdf(self, uploaded_file):
-        try:
-            filename = uploaded_file.name
-            text_content = ""
-            
-            try:
-                with pdfplumber.open(uploaded_file) as pdf:
-                    for page in pdf.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content += page_text + "\n"
-            except:
-                pdf_reader = PyPDF2.PdfReader(uploaded_file)
-                for page in pdf_reader.pages:
-                    text_content += page.extract_text() + "\n"
-            
-            analysis = {
-                'filename': filename,
-                'type': 'PDF',
-                'text_content': text_content[:5000],
-                'document_type': self._identify_document_type(text_content),
-                'key_findings': self._extract_key_findings(text_content),
-                'insurance_metrics': self._extract_insurance_metrics(text_content)
-            }
-            
-            st.session_state.analyzed_data[filename] = analysis
-            return analysis
-            
-        except Exception as e:
-            return {'filename': uploaded_file.name, 'error': str(e)}
-    
-    def _identify_document_type(self, text):
-        text_lower = text.lower()
-        if any(word in text_lower for word in ['claim', 'loss run', 'incident']):
-            return "Claims Document"
-        elif any(word in text_lower for word in ['policy', 'certificate', 'coverage']):
-            return "Policy Document"
-        elif any(word in text_lower for word in ['financial', 'balance sheet', 'income']):
-            return "Financial Document"
-        else:
-            return "General Document"
-    
-    def _extract_key_findings(self, text):
-        findings = []
-        
-        money_pattern = r'\$[\d,]+\.?\d*'
-        money_matches = re.findall(money_pattern, text)
-        if money_matches:
-            findings.append(f"Found {len(money_matches)} monetary amounts")
-        
-        date_pattern = r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b'
-        date_matches = re.findall(date_pattern, text)
-        if date_matches:
-            findings.append(f"Found {len(date_matches)} date references")
-        
-        return findings
-    
-    def _extract_insurance_metrics(self, text):
-        metrics = {}
-        
-        money_pattern = r'\$[\d,]+\.?\d*'
-        money_amounts = re.findall(money_pattern, text)
-        if money_amounts:
-            metrics["monetary_amounts"] = len(money_amounts)
-        
-        limit_pattern = r'limit[s]?\s*[:\-]?\s*\$[\d,]+\.?\d*'
-        limit_matches = re.findall(limit_pattern, text, re.IGNORECASE)
-        if limit_matches:
-            metrics["coverage_limits"] = len(limit_matches)
-        
-        return metrics
-    
-    def generate_chat_response(self, question):
+    def prepare_context_for_llm(self) -> str:
+        """Prepare analyzed data context for the LLM"""
         if not st.session_state.analyzed_data:
-            return "🤖 Hi! I don't have any documents analyzed yet. Please upload and analyze some insurance files first, then I can answer questions about them!"
+            return "No insurance data has been analyzed yet."
         
-        question_lower = question.lower()
-        response_parts = []
+        context_parts = []
         
-        if any(greeting in question_lower for greeting in ['hello', 'hi', 'hey']):
-            files_count = len(st.session_state.analyzed_data)
-            files_list = list(st.session_state.analyzed_data.keys())
-            return f"🤖 Hello! I'm STEVE, your insurance analysis AI. I've analyzed {files_count} file(s): {', '.join(files_list)}. What would you like to know about your data?"
-        
-        if 'column' in question_lower or 'field' in question_lower:
-            for filename, analysis in st.session_state.analyzed_data.items():
-                if analysis['type'] in ['CSV', 'Excel']:
-                    if analysis['type'] == 'CSV':
-                        cols = analysis['column_names']
-                        insurance_cols = [col['column'] for col in analysis['insurance_columns']]
-                        response_parts.append(f"📊 **{filename}** has {len(cols)} columns:")
-                        response_parts.append(f"• All columns: {', '.join(cols)}")
-                        if insurance_cols:
-                            response_parts.append(f"• Insurance columns: {', '.join(insurance_cols)}")
-                    elif analysis['type'] == 'Excel':
-                        for sheet_name, sheet_info in analysis['sheets'].items():
-                            cols = sheet_info['column_names']
-                            response_parts.append(f"📋 **{filename} - {sheet_name}**: {', '.join(cols)}")
-        
-        elif any(word in question_lower for word in ['summary', 'overview', 'about']):
-            for filename, analysis in st.session_state.analyzed_data.items():
-                if analysis['type'] == 'CSV':
-                    response_parts.append(f"📄 **{filename}** Summary:")
-                    response_parts.append(f"• {analysis['rows']:,} rows × {analysis['columns']} columns")
-                    response_parts.append(f"• Insurance columns detected: {len(analysis['insurance_columns'])}")
-                elif analysis['type'] == 'Excel':
-                    response_parts.append(f"📄 **{filename}** Summary:")
-                    response_parts.append(f"• {analysis['total_sheets']} sheets, {analysis.get('total_rows', 0):,} total rows")
-                    response_parts.append(f"• {analysis.get('total_insurance_cols', 0)} insurance columns across all sheets")
-                    response_parts.append(f"• Successfully processed: {analysis.get('processed_sheets', 0)}/{analysis['total_sheets']} sheets")
-                elif analysis['type'] == 'PDF':
-                    response_parts.append(f"📄 **{filename}** Summary:")
-                    response_parts.append(f"• Document Type: {analysis['document_type']}")
-                    response_parts.append(f"• Key Findings: {', '.join(analysis['key_findings'])}")
-        
-        elif any(word in question_lower for word in ['total', 'sum', 'amount']):
-            found_totals = False
-            for filename, analysis in st.session_state.analyzed_data.items():
-                if analysis['type'] == 'CSV' and analysis.get('summary_stats'):
-                    response_parts.append(f"💰 **{filename}** - Financial Totals:")
+        for filename, analysis in st.session_state.analyzed_data.items():
+            if analysis['type'] == 'CSV':
+                context_parts.append(f"CSV File: {filename}")
+                context_parts.append(f"- {analysis['rows']:,} rows, {analysis['columns']} columns")
+                context_parts.append(f"- Columns: {', '.join(analysis['column_names'])}")
+                
+                if analysis['insurance_columns']:
+                    ins_cols = [f"{col['column']} ({col['category']})" for col in analysis['insurance_columns']]
+                    context_parts.append(f"- Insurance columns: {', '.join(ins_cols)}")
+                
+                if analysis['summary_stats']:
+                    context_parts.append("- Financial data:")
                     for col, stats in analysis['summary_stats'].items():
-                        if stats['sum'] > 0 and any(keyword in col.lower() for keyword in ['premium', 'amount', 'paid', 'loss', 'reserve']):
-                            response_parts.append(f"• {col}: ${stats['sum']:,.2f} (avg: ${stats['mean']:,.2f})")
-                            found_totals = True
-                elif analysis['type'] == 'Excel':
-                    response_parts.append(f"💰 **{filename}** - Excel Financial Totals:")
-                    for sheet_name, sheet_info in analysis['sheets'].items():
-                        if 'error' not in sheet_info and sheet_info.get('summary_stats'):
-                            for col, stats in sheet_info['summary_stats'].items():
-                                if stats['sum'] > 0 and any(keyword in col.lower() for keyword in ['premium', 'amount', 'paid', 'loss', 'reserve']):
-                                    response_parts.append(f"• {sheet_name} - {col}: ${stats['sum']:,.2f}")
-                                    found_totals = True
-            
-            if not found_totals:
-                response_parts.append("🔍 I couldn't find obvious monetary columns. Could you specify which amounts you're interested in?")
+                        if any(kw in col.lower() for kw in ['premium', 'amount', 'paid', 'loss', 'reserve']):
+                            context_parts.append(f"  * {col}: Total ${stats['sum']:,.2f}, Average ${stats['mean']:,.2f}")
+                
+            elif analysis['type'] == 'Excel':
+                context_parts.append(f"Excel File: {filename}")
+                context_parts.append(f"- {analysis['total_sheets']} sheets, {analysis['total_rows']:,} total rows")
+                
+                for sheet_name, sheet_info in analysis['sheets'].items():
+                    if 'error' not in sheet_info:
+                        context_parts.append(f"- Sheet '{sheet_name}': {sheet_info['rows']:,} rows")
+                        if sheet_info['insurance_columns']:
+                            ins_cols = [col['column'] for col in sheet_info['insurance_columns']]
+                            context_parts.append(f"  * Insurance columns: {', '.join(ins_cols)}")
         
-        elif any(word in question_lower for word in ['quality', 'missing', 'problem', 'issue']):
-            for filename, analysis in st.session_state.analyzed_data.items():
-                if analysis['type'] == 'CSV':
-                    response_parts.append(f"⚠️ **{filename}** - Data Quality Report:")
-                    
-                    if analysis['data_quality']['missing_data']:
-                        response_parts.append("• Missing data issues:")
-                        for col, info in list(analysis['data_quality']['missing_data'].items())[:3]:
-                            response_parts.append(f"  - {col}: {info['percentage']}% missing ({info['count']} rows)")
-                    else:
-                        response_parts.append("• ✅ No significant missing data")
-                    
-                    if analysis['data_quality']['duplicates'] > 0:
-                        response_parts.append(f"• ⚠️ {analysis['data_quality']['duplicates']} duplicate rows found")
-                    else:
-                        response_parts.append("• ✅ No duplicate rows")
+        return "\n".join(context_parts)
+    
+    def generate_chat_response(self, question: str, provider: str) -> str:
+        """Generate intelligent chat response using LLM"""
+        if not st.session_state.analyzed_data:
+            return "🤖 Hi! I don't have any documents analyzed yet. Please upload and analyze some insurance files first, then I can answer questions about them using advanced AI!"
         
-        if not response_parts:
-            available_files = ', '.join(st.session_state.analyzed_data.keys())
-            response_parts.append(f"🤔 I'm not sure how to answer that. I have data from: {available_files}")
-            response_parts.append("\nTry asking:")
-            response_parts.append("• 'What columns do I have?'")
-            response_parts.append("• 'Show me a summary'")
-            response_parts.append("• 'What are the total amounts?'")
-            response_parts.append("• 'Any data quality issues?'")
+        context_data = self.prepare_context_for_llm()
         
-        return "\n".join(response_parts)
+        if provider == 'fallback':
+            return self.generate_fallback_response(question)
+        
+        return self.generate_llm_response(question, context_data, provider)
+    
+    def generate_fallback_response(self, question: str) -> str:
+        """Simple fallback response without LLM API"""
+        question_lower = question.lower()
+        
+        if 'hello' in question_lower or 'hi' in question_lower:
+            return "🤖 Hello! I'm STEVE, your insurance AI assistant. I can analyze your data and answer questions. For advanced AI responses, please configure an API key in the sidebar!"
+        
+        context = self.prepare_context_for_llm()
+        return f"🤖 Here's what I found in your data:\n\n{context}\n\nFor more intelligent analysis and insights, please set up an LLM API in the sidebar settings."
 
 def main():
-    steve = SteveWebApp()
+    steve = SteveWithLLM()
     
     st.markdown('<div class="main-header">🤖 STEVE</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">Smart Technology for Evaluating insurance documents and Validating Exposures</div>', unsafe_allow_html=True)
     
     with st.sidebar:
+        st.header("🔧 LLM Configuration")
+        
+        provider = st.selectbox(
+            "Choose LLM Provider:",
+            ['openai', 'anthropic', 'groq', 'huggingface', 'fallback'],
+            help="Select your preferred AI model provider"
+        )
+        
+        if provider != 'fallback' and provider != 'huggingface':
+            api_key = st.text_input(
+                f"Enter {provider.upper()} API Key:",
+                type="password",
+                help=f"Get your API key from {provider}.com"
+            )
+            
+            if api_key:
+                if steve.setup_llm_client(provider, api_key):
+                    st.success(f"✅ Connected to {provider.upper()}")
+                    st.session_state.llm_provider = provider
+                else:
+                    st.error(f"❌ Failed to connect to {provider.upper()}")
+            else:
+                st.warning(f"⚠️ Please enter your {provider.upper()} API key")
+        elif provider == 'huggingface':
+            st.info("🤗 Using local Hugging Face model (free, but slower)")
+            st.session_state.llm_provider = provider
+        else:
+            st.info("📊 Using basic pattern matching (no LLM)")
+            st.session_state.llm_provider = provider
+        
         st.header("📁 Upload Documents")
         uploaded_files = st.file_uploader(
             "Choose insurance files to analyze",
@@ -462,8 +433,6 @@ def main():
                             result = steve.analyze_csv(file)
                         elif file.name.endswith(('.xlsx', '.xls')):
                             result = steve.analyze_excel(file)
-                        elif file.name.endswith('.pdf'):
-                            result = steve.analyze_pdf(file)
                         
                         if 'error' not in result:
                             st.success(f"✅ Analyzed: {file.name}")
@@ -476,26 +445,33 @@ def main():
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown("""
-            ### 🚀 Welcome to STEVE!
+            ### 🚀 Welcome to STEVE with AI!
             
-            Your AI-powered insurance document analysis platform specifically designed for P&C insurance companies.
+            Your AI-powered insurance document analysis platform with advanced language model integration.
             
-            **What STEVE can analyze:**
-            - 📊 Claims data and loss runs
-            - 📋 Policy information and coverage details
-            - 💰 Financial reports and premium data
-            - 📄 Regulatory filings and compliance documents
+            **🧠 AI-Powered Features:**
+            - **GPT-4** integration for advanced analysis
+            - **Claude** support for detailed insights
+            - **Groq** for fast responses
+            - **Local AI** options available
             
-            **Get started:**
-            1. Upload your files using the sidebar
-            2. Click "Analyze Files"
-            3. Chat with STEVE about your data
+            **📊 What STEVE can analyze:**
+            - Claims data and loss runs
+            - Policy information and coverage details
+            - Financial reports and premium data
+            - Regulatory filings and compliance documents
             
-            Ready to revolutionize your insurance data analysis? Upload your files to begin! 🚀
+            **🔧 Setup:**
+            1. Choose your AI provider in the sidebar
+            2. Enter your API key (or use free local option)
+            3. Upload your insurance files
+            4. Chat with STEVE using advanced AI!
+            
+            Ready for intelligent insurance analysis? Configure your AI and upload files! 🚀
             """)
     
     else:
-        tab1, tab2, tab3 = st.tabs(["📊 Analysis Results", "💬 Chat with STEVE", "📈 Visualizations"])
+        tab1, tab2, tab3 = st.tabs(["📊 Analysis Results", "💬 Chat with AI STEVE", "📈 Visualizations"])
         
         with tab1:
             st.header("📊 Analysis Results")
@@ -522,74 +498,50 @@ def main():
                             st.subheader("🏢 Insurance Columns Detected")
                             for col_info in analysis['insurance_columns']:
                                 st.write(f"• **{col_info['column']}** ({col_info['category']})")
-                        
-                        if analysis['data_quality']['missing_data']:
-                            st.subheader("⚠️ Data Quality Issues")
-                            for col, info in analysis['data_quality']['missing_data'].items():
-                                st.warning(f"**{col}**: {info['percentage']}% missing data ({info['count']} rows)")
                     
                     elif analysis['type'] == 'Excel':
-                        col1, col2, col3, col4 = st.columns(4)
+                        col1, col2, col3 = st.columns(3)
                         with col1:
                             st.metric("Total Sheets", analysis['total_sheets'])
                         with col2:
-                            st.metric("Processed Sheets", f"{analysis.get('processed_sheets', 0)}")
+                            st.metric("Total Rows", f"{analysis['total_rows']:,}")
                         with col3:
-                            st.metric("Total Rows", f"{analysis.get('total_rows', 0):,}")
-                        with col4:
-                            st.metric("Insurance Columns", analysis.get('total_insurance_cols', 0))
+                            st.metric("Insurance Columns", analysis['total_insurance_cols'])
                         
                         for sheet_name, sheet_info in analysis['sheets'].items():
-                            if 'error' in sheet_info:
-                                st.error(f"**{sheet_name}**: {sheet_info['error']}")
-                            else:
+                            if 'error' not in sheet_info:
                                 st.write(f"📋 **{sheet_name}**: {sheet_info['rows']:,} rows × {sheet_info['columns']} columns")
-                                
-                                if sheet_info.get('insurance_columns'):
-                                    st.write("🏢 Insurance columns detected:")
-                                    for col_info in sheet_info['insurance_columns']:
-                                        st.write(f"  • **{col_info['column']}** ({col_info['category']})")
-                                
-                                if sheet_info.get('data_quality', {}).get('missing_data'):
-                                    st.write("⚠️ Data quality issues:")
-                                    for col, info in sheet_info['data_quality']['missing_data'].items():
-                                        st.warning(f"  {col}: {info['percentage']}% missing")
-                        
-                        if analysis.get('recommendations'):
-                            st.subheader("💡 Recommendations")
-                            for rec in analysis['recommendations']:
-                                st.write(f"• {rec}")
-
-                    
-                    elif analysis['type'] == 'PDF':
-                        st.write(f"**Document Type**: {analysis['document_type']}")
-                        if analysis['key_findings']:
-                            st.write("**Key Findings**:")
-                            for finding in analysis['key_findings']:
-                                st.write(f"• {finding}")
         
         with tab2:
-            st.header("💬 Chat with STEVE")
+            st.header("💬 Chat with AI STEVE")
+            
+            provider_status = st.session_state.get('llm_provider', 'fallback')
+            if provider_status == 'fallback':
+                st.warning("⚠️ Using basic responses. Configure an LLM API in the sidebar for intelligent AI chat!")
+            elif provider_status == 'huggingface':
+                st.info("🤗 Using local Hugging Face AI model")
+            else:
+                st.success(f"🤖 Connected to {provider_status.upper()} AI")
             
             if 'chat_history' not in st.session_state:
                 st.session_state.chat_history = []
             
-            for i, chat in enumerate(st.session_state.chat_history):
-                with st.container():
-                    st.markdown(f'<div class="user-message"><strong>You:</strong> {chat["user"]}</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="steve-response"><strong>🤖 STEVE:</strong> {chat["steve"]}</div>', unsafe_allow_html=True)
+            for chat in st.session_state.chat_history:
+                st.markdown(f'<div class="user-message"><strong>You:</strong> {chat["user"]}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="steve-response"><strong>🤖 AI STEVE:</strong> {chat["steve"]}</div>', unsafe_allow_html=True)
             
-            user_question = st.text_input("Ask STEVE about your insurance data:", placeholder="What columns do I have?", key="chat_input")
+            user_question = st.text_input("Ask STEVE anything about your insurance data:", placeholder="What insights can you provide about my claims data?", key="chat_input")
             
             col1, col2 = st.columns([1, 4])
             with col1:
                 if st.button("Send 🚀"):
                     if user_question:
-                        response = steve.generate_chat_response(user_question)
-                        st.session_state.chat_history.append({
-                            "user": user_question,
-                            "steve": response
-                        })
+                        with st.spinner("🤖 AI STEVE is thinking..."):
+                            response = steve.generate_chat_response(user_question, st.session_state.llm_provider)
+                            st.session_state.chat_history.append({
+                                "user": user_question,
+                                "steve": response
+                            })
                         st.rerun()
             
             with col2:
@@ -597,25 +549,26 @@ def main():
                     st.session_state.chat_history = []
                     st.rerun()
             
-            st.subheader("💡 Suggested Questions")
-            suggested_questions = [
-                "What columns do I have?",
-                "Show me a summary of my data",
-                "What are the total premium amounts?",
-                "Are there any data quality issues?",
-                "Tell me about claims data",
-                "What do you recommend?"
+            st.subheader("💡 AI-Powered Questions to Try")
+            ai_questions = [
+                "What trends do you see in my insurance data?",
+                "Are there any anomalies or red flags I should investigate?",
+                "What recommendations do you have for improving our loss ratios?",
+                "Can you explain the relationship between premiums and claims in my data?",
+                "What insights can you provide about our policy portfolio?",
+                "How does our claims frequency compare to industry standards?"
             ]
             
             cols = st.columns(2)
-            for i, question in enumerate(suggested_questions):
+            for i, question in enumerate(ai_questions):
                 with cols[i % 2]:
-                    if st.button(question, key=f"suggest_{i}"):
-                        response = steve.generate_chat_response(question)
-                        st.session_state.chat_history.append({
-                            "user": question,
-                            "steve": response
-                        })
+                    if st.button(question, key=f"ai_suggest_{i}"):
+                        with st.spinner("🤖 AI STEVE is analyzing..."):
+                            response = steve.generate_chat_response(question, st.session_state.llm_provider)
+                            st.session_state.chat_history.append({
+                                "user": question,
+                                "steve": response
+                            })
                         st.rerun()
         
         with tab3:
@@ -636,23 +589,6 @@ def main():
                         col = monetary_cols[0]
                         fig = px.histogram(df, x=col, title=f"Distribution of {col}")
                         st.plotly_chart(fig, use_container_width=True)
-                        
-                        stats_data = []
-                        for col in monetary_cols:
-                            if col in analysis['summary_stats']:
-                                stats = analysis['summary_stats'][col]
-                                stats_data.append({
-                                    'Column': col,
-                                    'Total': f"${stats['sum']:,.2f}",
-                                    'Average': f"${stats['mean']:,.2f}",
-                                    'Median': f"${stats['median']:,.2f}",
-                                    'Min': f"${stats['min']:,.2f}",
-                                    'Max': f"${stats['max']:,.2f}"
-                                })
-                        
-                        if stats_data:
-                            st.subheader("📋 Financial Summary")
-                            st.dataframe(pd.DataFrame(stats_data), use_container_width=True)
 
 if __name__ == "__main__":
     main()
