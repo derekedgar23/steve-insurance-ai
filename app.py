@@ -9,9 +9,33 @@ import re
 from datetime import datetime
 import warnings
 import json
-import openai
 from typing import Dict, List, Any
 warnings.filterwarnings('ignore')
+
+# Optional LLM imports - won't break if not available
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+try:
+    from transformers import pipeline
+    HUGGINGFACE_AVAILABLE = True
+except ImportError:
+    HUGGINGFACE_AVAILABLE = False
 
 st.set_page_config(
     page_title="STEVE - Insurance AI",
@@ -93,18 +117,20 @@ class SteveWithLLM:
     def setup_llm_client(self, provider: str, api_key: str):
         """Setup the LLM client based on provider"""
         try:
-            if provider == 'openai':
+            if provider == 'openai' and OPENAI_AVAILABLE:
                 openai.api_key = api_key
                 return True
-            elif provider == 'anthropic':
-                import anthropic
+            elif provider == 'anthropic' and ANTHROPIC_AVAILABLE:
                 self.anthropic_client = anthropic.Anthropic(api_key=api_key)
                 return True
-            elif provider == 'groq':
-                from groq import Groq
+            elif provider == 'groq' and GROQ_AVAILABLE:
                 self.groq_client = Groq(api_key=api_key)
                 return True
-            return False
+            elif provider == 'huggingface' and HUGGINGFACE_AVAILABLE:
+                return True
+            else:
+                st.error(f"{provider} library not installed. Using fallback mode.")
+                return False
         except Exception as e:
             st.error(f"Error setting up {provider}: {str(e)}")
             return False
@@ -127,7 +153,7 @@ Your role is to:
 Always be professional, accurate, and focus on practical insurance applications. Use specific data from the context when possible."""
 
         try:
-            if provider == 'openai':
+            if provider == 'openai' and OPENAI_AVAILABLE:
                 response = openai.chat.completions.create(
                     model="gpt-4",
                     messages=[
@@ -139,7 +165,7 @@ Always be professional, accurate, and focus on practical insurance applications.
                 )
                 return response.choices[0].message.content
                 
-            elif provider == 'anthropic':
+            elif provider == 'anthropic' and ANTHROPIC_AVAILABLE:
                 message = self.anthropic_client.messages.create(
                     model="claude-3-sonnet-20240229",
                     max_tokens=1000,
@@ -148,7 +174,7 @@ Always be professional, accurate, and focus on practical insurance applications.
                 )
                 return message.content[0].text
                 
-            elif provider == 'groq':
+            elif provider == 'groq' and GROQ_AVAILABLE:
                 completion = self.groq_client.chat.completions.create(
                     model="llama3-70b-8192",
                     messages=[
@@ -160,8 +186,11 @@ Always be professional, accurate, and focus on practical insurance applications.
                 )
                 return completion.choices[0].message.content
                 
-            elif provider == 'huggingface':
+            elif provider == 'huggingface' and HUGGINGFACE_AVAILABLE:
                 return self.generate_huggingface_response(user_question, context_data)
+            
+            else:
+                return f"🤖 The {provider} provider is not available. Please install the required package or use a different provider."
                 
         except Exception as e:
             return f"Sorry, I encountered an error with the {provider} API: {str(e)}. Please check your API key and try again."
@@ -169,7 +198,8 @@ Always be professional, accurate, and focus on practical insurance applications.
     def generate_huggingface_response(self, user_question: str, context_data: str) -> str:
         """Generate response using Hugging Face transformers (local/free option)"""
         try:
-            from transformers import pipeline
+            if not HUGGINGFACE_AVAILABLE:
+                return "🤖 Hugging Face transformers not available. Please use a different provider or install transformers."
             
             if 'hf_generator' not in st.session_state:
                 st.session_state.hf_generator = pipeline(
@@ -179,13 +209,12 @@ Always be professional, accurate, and focus on practical insurance applications.
                     max_new_tokens=200
                 )
             
-            prompt = f"As an insurance AI assistant analyzing: {context_data[:500]}...\n\nUser question: {user_question}\n\nResponse:"
-            
+            prompt = f"Insurance AI analyzing: {context_data[:200]}... Question: {user_question}"
             response = st.session_state.hf_generator(prompt)[0]['generated_text']
             return f"🤖 Based on your insurance data: {response}"
             
         except Exception as e:
-            return "I'm having trouble with the local AI model. Please try one of the API options instead."
+            return f"🤖 Local AI model error: {str(e)}. Try using an API provider instead."
     
     def analyze_csv(self, uploaded_file):
         try:
@@ -387,33 +416,49 @@ def main():
     with st.sidebar:
         st.header("🔧 LLM Configuration")
         
+        available_providers = ['fallback']
+        if OPENAI_AVAILABLE:
+            available_providers.insert(0, 'openai')
+        if ANTHROPIC_AVAILABLE:
+            available_providers.insert(-1, 'anthropic')
+        if GROQ_AVAILABLE:
+            available_providers.insert(-1, 'groq')
+        if HUGGINGFACE_AVAILABLE:
+            available_providers.insert(-1, 'huggingface')
+        
         provider = st.selectbox(
             "Choose LLM Provider:",
-            ['openai', 'anthropic', 'groq', 'huggingface', 'fallback'],
+            available_providers,
             help="Select your preferred AI model provider"
         )
         
-        if provider != 'fallback' and provider != 'huggingface':
-            api_key = st.text_input(
-                f"Enter {provider.upper()} API Key:",
-                type="password",
-                help=f"Get your API key from {provider}.com"
-            )
-            
-            if api_key:
-                if steve.setup_llm_client(provider, api_key):
-                    st.success(f"✅ Connected to {provider.upper()}")
-                    st.session_state.llm_provider = provider
-                else:
-                    st.error(f"❌ Failed to connect to {provider.upper()}")
-            else:
-                st.warning(f"⚠️ Please enter your {provider.upper()} API key")
+        if provider == 'fallback':
+            st.info("📊 Using basic pattern matching (no AI)")
+            st.session_state.llm_provider = provider
         elif provider == 'huggingface':
-            st.info("🤗 Using local Hugging Face model (free, but slower)")
-            st.session_state.llm_provider = provider
+            if HUGGINGFACE_AVAILABLE:
+                st.info("🤗 Using local Hugging Face model (free, but slower)")
+                st.session_state.llm_provider = provider
+            else:
+                st.error("❌ Transformers library not installed")
         else:
-            st.info("📊 Using basic pattern matching (no LLM)")
-            st.session_state.llm_provider = provider
+            if provider in ['openai', 'anthropic', 'groq']:
+                api_key = st.text_input(
+                    f"Enter {provider.upper()} API Key:",
+                    type="password",
+                    help=f"Get your API key from {provider}.com"
+                )
+                
+                if api_key:
+                    if steve.setup_llm_client(provider, api_key):
+                        st.success(f"✅ Connected to {provider.upper()}")
+                        st.session_state.llm_provider = provider
+                    else:
+                        st.error(f"❌ Failed to connect to {provider.upper()}")
+                        st.session_state.llm_provider = 'fallback'
+                else:
+                    st.warning(f"⚠️ Please enter your {provider.upper()} API key")
+                    st.session_state.llm_provider = 'fallback'
         
         st.header("📁 Upload Documents")
         uploaded_files = st.file_uploader(
