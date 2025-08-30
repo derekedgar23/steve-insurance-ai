@@ -10,9 +10,13 @@ import re
 from datetime import datetime, timedelta
 import warnings
 from typing import Dict, List, Any, Tuple
-from scipy import stats
-import seaborn as sns
 warnings.filterwarnings('ignore')
+
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 try:
     import openai
@@ -294,9 +298,16 @@ class AdvancedInsuranceAnalyzer:
                     
                     if len(monthly_data) >= 3:
                         # Calculate trend
-                        x = range(len(monthly_data))
-                        y = monthly_data['sum'].values
-                        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+                        if SCIPY_AVAILABLE:
+                            x = range(len(monthly_data))
+                            y = monthly_data['sum'].values
+                            slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+                        else:
+                            # Simple trend calculation without scipy
+                            x = np.arange(len(monthly_data))
+                            y = monthly_data['sum'].values
+                            slope = np.polyfit(x, y, 1)[0]
+                            r_value = np.corrcoef(x, y)[0, 1] if len(x) > 1 else 0
                         
                         trend_direction = "increasing" if slope > 0 else "decreasing"
                         trend_strength = "strong" if abs(r_value) > 0.7 else "moderate" if abs(r_value) > 0.3 else "weak"
